@@ -223,7 +223,7 @@ This happens because the search space is split across threads.
 
 ## ⚡ Performance
 
-This is a CPU-bound, embarrassingly parallel workload:
+The CPU path is an embarrassingly parallel workload:
 
 - More cores → near-linear speedup
 - Single-core performance still matters
@@ -233,7 +233,7 @@ This is a CPU-bound, embarrassingly parallel workload:
 - Apple M2:
   - ~100 seconds for 4 characters after `xch1`
 
-The WebGPU result depends heavily on the browser and GPU. On the development machine, the complete integrated path sustained about 29,000 verified address candidates per second versus about 3,300/second for the multi-worker CPU path; use the in-app rate for the device you are actually searching on.
+The WebGPU result depends heavily on the browser, GPU, and driver. On the development Mac, the warmed end-to-end GPU path sustained about 66,900 verified address candidates per second versus 29,700/second for the previous CPU-bridged GPU implementation. GPU batches start small and adapt toward roughly 250 ms per dispatch, providing responsive progress updates and avoiding long Windows dispatches that can trigger the GPU watchdog. Use the in-app rate for the device you are actually searching on.
 
 ---
 

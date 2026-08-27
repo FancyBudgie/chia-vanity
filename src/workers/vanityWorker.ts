@@ -93,6 +93,36 @@ interface GpuSearcher {
     free(): void;
 }
 
+const GPU_INITIAL_BATCH_SIZE = 4096;
+const GPU_MIN_BATCH_SIZE = 1024;
+const GPU_BATCH_ALIGNMENT = 256;
+const GPU_TARGET_BATCH_MS = 250;
+
+function nextGpuBatchSize(
+    currentCount: number,
+    elapsedMs: number,
+    capacity: number,
+): number {
+    if (!Number.isFinite(elapsedMs) || elapsedMs <= 0) {
+        return currentCount;
+    }
+
+    // Keep individual dispatches well below the Windows GPU watchdog while
+    // allowing fast devices to ramp to the full batch capacity.
+    const scale = Math.max(
+        0.5,
+        Math.min(2, GPU_TARGET_BATCH_MS / elapsedMs),
+    );
+    const desired = Math.round(
+        (currentCount * scale) / GPU_BATCH_ALIGNMENT,
+    ) * GPU_BATCH_ALIGNMENT;
+
+    return Math.max(
+        Math.min(GPU_MIN_BATCH_SIZE, capacity),
+        Math.min(capacity, desired),
+    );
+}
+
 const CHIA_PURPOSE = 12381;
 const CHIA_COIN_TYPE = 8444;
 const CHIA_ACCOUNT = 2;
@@ -592,6 +622,7 @@ async function runGpuSearch(
     const wantedPrefixLower = payload.wantedPrefix.toLowerCase();
     const wantedSuffixLower = payload.wantedSuffix.toLowerCase();
     let index = payload.startIndex;
+    let batchSize = Math.min(GPU_INITIAL_BATCH_SIZE, searcher.batchCapacity);
 
     try {
         while (index <= endIndex) {
@@ -604,7 +635,7 @@ async function runGpuSearch(
             }
 
             const remaining = Math.floor((endIndex - index) / payload.step) + 1;
-            const count = Math.min(searcher.batchCapacity, remaining);
+            const count = Math.min(batchSize, remaining);
             const result = await searcher.searchBatch(
                 index,
                 count,
@@ -612,6 +643,11 @@ async function runGpuSearch(
                 prefix,
                 wantedPrefixLower,
                 wantedSuffixLower,
+            );
+            batchSize = nextGpuBatchSize(
+                count,
+                result.elapsedMs,
+                searcher.batchCapacity,
             );
 
             if (

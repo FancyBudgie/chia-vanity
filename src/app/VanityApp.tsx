@@ -71,7 +71,7 @@ export default function VanityApp() {
     const [results, setResults] = useState<Array<SearchHitPayload | DeriveAddressPayload>>([]);
     const [resultLabel, setResultLabel] = useState('No result yet');
     const [error, setError] = useState('');
-    const [, setStatus] = useState('Idle');
+    const [status, setStatus] = useState('Idle');
     const [sageKey, setSageKey] = useState<SageKeyMaterial | null>(null);
     const [sagePublicKeysReady, setSagePublicKeysReady] = useState(false);
     const [sageCapabilities, setSageCapabilities] = useState<string[]>([]);
@@ -91,6 +91,21 @@ export default function VanityApp() {
         }
 
     }, [themeMode]);
+
+    useEffect(() => {
+        if (uiState === 'idle' || searchStartedAtRef.current === null) {
+            return;
+        }
+
+        const updateElapsed = () => {
+            if (searchStartedAtRef.current !== null) {
+                setElapsedSecs((performance.now() - searchStartedAtRef.current) / 1000);
+            }
+        };
+        updateElapsed();
+        const intervalId = window.setInterval(updateElapsed, 100);
+        return () => window.clearInterval(intervalId);
+    }, [uiState]);
 
     useEffect(() => {
         let cancelled = false;
@@ -353,7 +368,13 @@ export default function VanityApp() {
         setElapsedSecs(0);
         setActiveCpuWorkers(null);
         setCpuTuning(null);
-        setStatus('Starting');
+        setStatus(
+            effectiveGpuSearchEnabled
+                ? effectiveCpuSearchEnabled
+                    ? 'Preparing WebGPU and CPU workers…'
+                    : 'Preparing WebGPU…'
+                : 'Starting CPU workers…',
+        );
         setUiState('running');
         sageSearchCancelRef.current = false;
         manualStopRequestedRef.current = false;
@@ -1178,13 +1199,23 @@ export default function VanityApp() {
                         <section style={styles.panel}>
                             <div style={styles.panelHeader}>
                                 <h2 style={styles.sectionTitle}>Progress</h2>
+                                <span style={styles.progressStatus} role="status">
+                                    <span style={styles.progressDot} aria-hidden="true" />
+                                    {status}
+                                </span>
                             </div>
 
                             <div style={styles.metricGrid}>
-                                <Metric label="Checked" value={checked.toLocaleString()} />
-                                <Metric label="Rate" value={`${formatNumber(ratePerSec)}/s`} />
+                                <Metric
+                                    label="Checked"
+                                    value={checked > 0 ? checked.toLocaleString() : 'Preparing…'}
+                                />
+                                <Metric
+                                    label="Rate"
+                                    value={checked > 0 ? `${formatNumber(ratePerSec)}/s` : 'Measuring…'}
+                                />
                                 <Metric label="Elapsed" value={`${elapsedSecs.toFixed(1)} s`} />
-                                {activeCpuWorkers !== null ? (
+                                {activeCpuWorkers !== null && activeCpuWorkers > 0 ? (
                                     <Metric label="CPU workers" value={activeCpuWorkers.toLocaleString()} />
                                 ) : null}
                             </div>
@@ -1826,6 +1857,21 @@ const styles: Record<string, React.CSSProperties> = {
         fontSize: 15,
         fontWeight: 760,
         letterSpacing: 0,
+    },
+    progressStatus: {
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 8,
+        color: 'var(--text-muted)',
+        fontSize: 12,
+        fontWeight: 700,
+    },
+    progressDot: {
+        width: 8,
+        height: 8,
+        borderRadius: '50%',
+        background: 'var(--accent-text)',
+        boxShadow: '0 0 0 3px var(--accent-soft)',
     },
     segmented: {
         display: 'inline-grid',
