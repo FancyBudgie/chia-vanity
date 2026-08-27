@@ -615,8 +615,7 @@ async function runGpuSearch(
             );
 
             if (
-                typeof result.hitIndex === 'number' &&
-                typeof result.hitAddress === 'string'
+                typeof result.hitIndex === 'number'
             ) {
                 const verified = deriveCandidatesForIndex(
                     root,
@@ -627,7 +626,8 @@ async function runGpuSearch(
 
                 if (
                     !verified ||
-                    verified.address.toLowerCase() !== result.hitAddress?.toLowerCase() ||
+                    (typeof result.hitAddress === 'string' &&
+                        verified.address.toLowerCase() !== result.hitAddress.toLowerCase()) ||
                     !matchesWantedAddress(
                         verified.address,
                         wantedPrefixLower,

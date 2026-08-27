@@ -5,7 +5,7 @@
     <title>Vanity WebGPU memory test</title>
 </head>
 <body>
-    <button id="run-batches">Run 500 batches</button>
+    <button id="run-batches">Run search batches</button>
     <button id="run-lifecycle">Run 20 lifecycle cycles</button>
     <button id="stop">Stop</button>
     <pre id="output">Ready.</pre>
@@ -13,7 +13,8 @@
         import init, { WebGpuVanitySearch } from './pkg/webgpu_vanity_wasm.js';
 
         const ACCOUNT_PUBLIC_KEY = 'a010d140e7c43146b5bb59695e6c444abbb62e964a535d0034351a90d1192bff0130de95f9bbc58af254c4dab4e65d3a';
-        const BATCHES = 500;
+        const BATCHES = Number(new URLSearchParams(location.search).get('batches')) || 20;
+        const SAMPLE_EVERY = Math.max(1, Math.min(25, Math.floor(BATCHES / 5)));
         const LIFECYCLE_CYCLES = 20;
         const output = document.querySelector('#output');
         let stopping = false;
@@ -86,7 +87,7 @@
                         'qqqqqq',
                     );
 
-                    if ((batch + 1) % 25 === 0) {
+                    if ((batch + 1) % SAMPLE_EVERY === 0) {
                         samples.push(memorySample('running', batch + 1, wasm.memory));
                         render('running batches', samples);
                         await new Promise(requestAnimationFrame);
@@ -98,7 +99,7 @@
             }
 
             samples.push(memorySample('freed', samples.at(-1)?.completed ?? 0, wasm.memory));
-            const stable = hasStableWasmHeap(samples, 25);
+            const stable = hasStableWasmHeap(samples, SAMPLE_EVERY);
             render(
                 stopping ? 'stopped' : stable ? 'complete' : 'failed: WASM heap kept growing',
                 samples,

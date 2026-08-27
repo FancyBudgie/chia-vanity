@@ -56,7 +56,7 @@ export default function VanityApp() {
     const [mode, setMode] = useState<Mode>('unhardened');
     const [workerCount, setWorkerCount] = useState(0);
     const [searchMode, setSearchMode] = useState<SearchMode>('fast');
-    const [cpuSearchEnabled, setCpuSearchEnabled] = useState(true);
+    const [cpuSearchEnabled, setCpuSearchEnabled] = useState(false);
     const [gpuSearchEnabled, setGpuSearchEnabled] = useState(true);
     const [deriveIndex, setDeriveIndex] = useState(0);
     const [derivePrefix, setDerivePrefix] = useState<AddressPrefix>('xch');
@@ -1024,6 +1024,27 @@ export default function VanityApp() {
                                         <label
                                             style={{
                                                 ...styles.checkboxOption,
+                                                ...(!gpuSearchAvailable
+                                                    ? styles.checkboxOptionDisabled
+                                                    : null),
+                                            }}
+                                            title={gpuUnavailableReason ?? 'Use WebGPU for the search'}
+                                        >
+                                            <input
+                                                style={styles.checkboxInput}
+                                                type="checkbox"
+                                                checked={effectiveGpuSearchEnabled}
+                                                onChange={(e) => handleComputeChange('gpu', e.target.checked)}
+                                                disabled={
+                                                    inputsDisabled ||
+                                                    !gpuSearchAvailable
+                                                }
+                                            />
+                                            <span>GPU (WebGPU)</span>
+                                        </label>
+                                        <label
+                                            style={{
+                                                ...styles.checkboxOption,
                                                 ...(effectiveCpuSearchEnabled && !effectiveGpuSearchEnabled && !gpuSearchAvailable
                                                     ? styles.checkboxOptionDisabled
                                                     : null),
@@ -1040,27 +1061,6 @@ export default function VanityApp() {
                                                 }
                                             />
                                             <span>CPU</span>
-                                        </label>
-                                        <label
-                                            style={{
-                                                ...styles.checkboxOption,
-                                                ...(!gpuSearchAvailable
-                                                    ? styles.checkboxOptionDisabled
-                                                    : null),
-                                            }}
-                                            title={gpuUnavailableReason ?? 'Use WebGPU alongside the CPU'}
-                                        >
-                                            <input
-                                                style={styles.checkboxInput}
-                                                type="checkbox"
-                                                checked={effectiveGpuSearchEnabled}
-                                                onChange={(e) => handleComputeChange('gpu', e.target.checked)}
-                                                disabled={
-                                                    inputsDisabled ||
-                                                    !gpuSearchAvailable
-                                                }
-                                            />
-                                            <span>GPU (WebGPU)</span>
                                         </label>
                                     </div>
                                     {gpuUnavailableReason ? (
@@ -1777,7 +1777,7 @@ const styles: Record<string, React.CSSProperties> = {
         fontWeight: 760,
         lineHeight: 1.2,
         overflowWrap: 'anywhere',
-        textTransform: 'capitalize',
+        textTransform: 'none',
     },
     tuningStatus: {
         display: 'flex',
@@ -2193,7 +2193,7 @@ const styles: Record<string, React.CSSProperties> = {
         color: 'var(--text-muted)',
         fontSize: 12,
         fontWeight: 750,
-        textTransform: 'capitalize',
+        textTransform: 'none',
     },
     addressLine: {
         fontFamily: monoStack,

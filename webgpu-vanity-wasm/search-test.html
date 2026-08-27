@@ -30,6 +30,7 @@
                 const childMismatches = [];
                 const mismatches = [];
                 const puzzleHashMismatches = [];
+                const nativeSearchMismatches = [];
 
                 for (let index = 0; index < count; index += 1) {
                     const child = accountPk.deriveUnhardened(start + index);
@@ -53,11 +54,67 @@
                     child.free();
                 }
 
-                const batch = await gpu.searchBatch(start, count, 1, 'xch', 'xch1', '');
+                for (const index of [0, 1, 2, 31, 32, 63, 64, 255, 256, 4095, 65535, 1_000_000]) {
+                    const child = accountPk.deriveUnhardened(index);
+                    const synthetic = child.deriveSynthetic();
+                    const address = new Address(standardPuzzleHash(synthetic), 'xch');
+                    const expected = address.encode();
+                    const nativeResult = await gpu.searchBatch(
+                        index,
+                        1,
+                        1,
+                        'xch',
+                        expected.slice(0, -6),
+                        expected.slice(-6),
+                    );
+                    if (nativeResult.hitIndex !== index) {
+                        nativeSearchMismatches.push(index);
+                    }
+                    address.free();
+                    synthetic.free();
+                    child.free();
+                }
+
+                const stridedTargetIndex = 1_021;
+                const stridedChild = accountPk.deriveUnhardened(stridedTargetIndex);
+                const stridedSynthetic = stridedChild.deriveSynthetic();
+                const stridedAddress = new Address(standardPuzzleHash(stridedSynthetic), 'xch');
+                const stridedExpected = stridedAddress.encode();
+                const stridedBatch = await gpu.searchBatch(
+                    1_000,
+                    4,
+                    7,
+                    'xch',
+                    stridedExpected.slice(0, -6),
+                    stridedExpected.slice(-6),
+                );
+                if (stridedBatch.hitIndex !== stridedTargetIndex) {
+                    nativeSearchMismatches.push('strided');
+                }
+                stridedAddress.free();
+                stridedSynthetic.free();
+                stridedChild.free();
+
                 const child0 = accountPk.deriveUnhardened(start);
                 const synthetic0 = child0.deriveSynthetic();
                 const address0 = new Address(standardPuzzleHash(synthetic0), 'xch');
                 const expectedAddress = address0.encode();
+                const exactBatch = await gpu.searchBatch(
+                    start,
+                    count,
+                    1,
+                    'xch',
+                    expectedAddress.slice(0, -6),
+                    expectedAddress.slice(-6),
+                );
+                const benchmark = await gpu.searchBatch(
+                    1_000_000,
+                    gpu.batchCapacity,
+                    1,
+                    'xch',
+                    'xch1qqqqqqqq',
+                    '',
+                );
                 const result = {
                     adapter: gpu.adapterName,
                     count,
@@ -66,9 +123,14 @@
                     childMismatches,
                     mismatches,
                     puzzleHashMismatches,
-                    batch,
+                    nativeSearchMismatches,
+                    exactBatch,
+                    benchmark,
+                    benchmarkKeysPerSecond: Math.round(
+                        benchmark.checked / (benchmark.elapsedMs / 1000),
+                    ),
                     expectedAddress,
-                    addressMatches: batch.hitAddress === expectedAddress,
+                    exactAddressMatches: exactBatch.hitIndex === start,
                     child0ExpectedHex: Array.from(child0.toBytes(), byte => byte.toString(16).padStart(2, '0')).join(''),
                     child0ActualHex: Array.from(gpuChildBytes.slice(0, 48), byte => byte.toString(16).padStart(2, '0')).join(''),
                 };
@@ -76,7 +138,8 @@
                 document.title = childMismatches.length === 0 &&
                     mismatches.length === 0 &&
                     puzzleHashMismatches.length === 0 &&
-                    result.addressMatches
+                    nativeSearchMismatches.length === 0 &&
+                    result.exactAddressMatches
                     ? 'DONE - GPU differential test'
                     : 'FAILED - GPU differential test';
                 address0.free();

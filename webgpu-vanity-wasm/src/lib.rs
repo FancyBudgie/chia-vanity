@@ -12,6 +12,7 @@ use web_time::Instant;
 use webgpu_groth16::gpu::curve::GpuCurve;
 use wgpu::util::DeviceExt;
 
+mod native_search;
 mod search;
 
 pub use search::WebGpuVanitySearch;

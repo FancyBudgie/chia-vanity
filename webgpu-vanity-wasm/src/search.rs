@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use bech32::{ToBase32, Variant};
 use blstrs::{G1Affine, G1Projective};
 use group::prime::PrimeCurveAffine;
 use num_bigint::BigInt;
@@ -12,10 +11,12 @@ use wgpu::util::DeviceExt;
 
 use crate::{
     CurveImpl, DERIVE_ENTRY, FIXED_BASE_ENTRY, NORMALIZE_ENTRY, POINT_BYTES, compress_gpu_point,
-    fixed_base_table, pipeline, readback, serialize_point, storage_entry,
+    fixed_base_table,
+    native_search::{NativeSearch, SEARCH_BATCH_CAPACITY},
+    pipeline, readback, serialize_point, storage_entry,
 };
 
-const BATCH_CAPACITY: u32 = 4096;
+const DERIVE_BATCH_CAPACITY: u32 = 4096;
 const SCALAR_BYTES: usize = 32;
 const PUBLIC_KEY_BYTES: usize = 48;
 const DEFAULT_HIDDEN_PUZZLE_HASH: [u8; 32] = [
@@ -93,8 +94,8 @@ fn first_stage_scalars(
     start_index: u32,
     step: u32,
 ) -> Vec<u8> {
-    let mut scalars = Vec::with_capacity(BATCH_CAPACITY as usize * SCALAR_BYTES);
-    for offset in 0..BATCH_CAPACITY {
+    let mut scalars = Vec::with_capacity(DERIVE_BATCH_CAPACITY as usize * SCALAR_BYTES);
+    for offset in 0..DERIVE_BATCH_CAPACITY {
         let index = start_index.wrapping_add(offset.wrapping_mul(step));
         let mut scalar = sha256(&[account_public_key, &index.to_be_bytes()]);
         scalar.reverse();
@@ -135,6 +136,7 @@ pub struct WebGpuVanitySearch {
     scalar_buffer: wgpu::Buffer,
     affine_output: wgpu::Buffer,
     staging: wgpu::Buffer,
+    native_search: NativeSearch,
 }
 
 #[wasm_bindgen]
@@ -154,7 +156,7 @@ impl WebGpuVanitySearch {
 
     #[wasm_bindgen(getter, js_name = batchCapacity)]
     pub fn batch_capacity(&self) -> u32 {
-        BATCH_CAPACITY
+        SEARCH_BATCH_CAPACITY
     }
 
     #[wasm_bindgen(js_name = deriveSyntheticPublicKeys)]
@@ -163,7 +165,7 @@ impl WebGpuVanitySearch {
         start_index: u32,
         count: u32,
     ) -> Result<Vec<u8>, JsValue> {
-        if count > BATCH_CAPACITY {
+        if count > DERIVE_BATCH_CAPACITY {
             return Err(JsValue::from_str("count exceeds GPU batch capacity"));
         }
         let points = self
@@ -179,7 +181,7 @@ impl WebGpuVanitySearch {
         start_index: u32,
         count: u32,
     ) -> Result<Vec<u8>, JsValue> {
-        if count > BATCH_CAPACITY {
+        if count > DERIVE_BATCH_CAPACITY {
             return Err(JsValue::from_str("count exceeds GPU batch capacity"));
         }
         let points = self
@@ -195,7 +197,7 @@ impl WebGpuVanitySearch {
         start_index: u32,
         count: u32,
     ) -> Result<Vec<u8>, JsValue> {
-        if count > BATCH_CAPACITY {
+        if count > DERIVE_BATCH_CAPACITY {
             return Err(JsValue::from_str("count exceeds GPU batch capacity"));
         }
         let points = self
@@ -219,7 +221,7 @@ impl WebGpuVanitySearch {
         wanted_prefix: String,
         wanted_suffix: String,
     ) -> Result<JsValue, JsValue> {
-        if count == 0 || count > BATCH_CAPACITY {
+        if count == 0 || count > SEARCH_BATCH_CAPACITY {
             return Err(JsValue::from_str(
                 "count must be within the GPU batch capacity",
             ));
@@ -229,37 +231,26 @@ impl WebGpuVanitySearch {
         }
 
         let started = Instant::now();
-        let points = self
-            .derive_batch(start_index, step)
+        let hit_index = self
+            .native_search
+            .search(
+                &self.device,
+                &self.queue,
+                start_index,
+                count,
+                step,
+                &address_prefix,
+                &wanted_prefix,
+                &wanted_suffix,
+            )
             .await
             .map_err(|error| JsValue::from_str(&format!("{error:#}")))?;
-        let wanted_prefix = wanted_prefix.to_lowercase();
-        let wanted_suffix = wanted_suffix.to_lowercase();
-        let mut hit_index = None;
-        let mut hit_address = None;
-
-        for (offset, public_key) in points.iter().take(count as usize).enumerate() {
-            let puzzle_hash = standard_puzzle_hash(public_key);
-            let address =
-                bech32::encode(&address_prefix, puzzle_hash.to_base32(), Variant::Bech32m)
-                    .context("failed to encode Chia address")
-                    .map_err(|error| JsValue::from_str(&format!("{error:#}")))?;
-            let address_lower = address.to_lowercase();
-            if (!wanted_prefix.is_empty() && !address_lower.starts_with(&wanted_prefix))
-                || (!wanted_suffix.is_empty() && !address_lower.ends_with(&wanted_suffix))
-            {
-                continue;
-            }
-            hit_index = Some(start_index.wrapping_add((offset as u32).wrapping_mul(step)));
-            hit_address = Some(address);
-            break;
-        }
 
         serde_wasm_bindgen::to_value(&SearchBatchResult {
             checked: count,
             elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
             hit_index,
-            hit_address,
+            hit_address: None,
         })
         .map_err(|error| JsValue::from_str(&error.to_string()))
     }
@@ -268,6 +259,7 @@ impl WebGpuVanitySearch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bech32::{ToBase32, Variant};
     use blstrs::Scalar;
     use group::{Curve, Group, GroupEncoding};
 
@@ -418,10 +410,10 @@ impl WebGpuVanitySearch {
             contents: &account_point,
             usage: wgpu::BufferUsages::STORAGE,
         });
-        let output_size = BATCH_CAPACITY as u64 * POINT_BYTES as u64;
+        let output_size = DERIVE_BATCH_CAPACITY as u64 * POINT_BYTES as u64;
         let scalar_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Vanity derivation scalars"),
-            size: BATCH_CAPACITY as u64 * SCALAR_BYTES as u64,
+            size: DERIVE_BATCH_CAPACITY as u64 * SCALAR_BYTES as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -543,6 +535,8 @@ impl WebGpuVanitySearch {
         }
         queue.submit(Some(encoder.finish()));
 
+        let native_search = NativeSearch::new(&device, &account_public_key, &account_affine)?;
+
         Ok(Self {
             device,
             queue,
@@ -559,6 +553,7 @@ impl WebGpuVanitySearch {
             scalar_buffer,
             affine_output,
             staging,
+            native_search,
         })
     }
 
@@ -580,7 +575,7 @@ impl WebGpuVanitySearch {
             });
             pass.set_pipeline(&self.convert_pipeline);
             pass.set_bind_group(0, &self.convert_children_group, &[]);
-            pass.dispatch_workgroups(BATCH_CAPACITY.div_ceil(64), 1, 1);
+            pass.dispatch_workgroups(DERIVE_BATCH_CAPACITY.div_ceil(64), 1, 1);
         }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -589,7 +584,7 @@ impl WebGpuVanitySearch {
             });
             pass.set_pipeline(derive_pipeline);
             pass.set_bind_group(0, derive_group, &[]);
-            pass.dispatch_workgroups(BATCH_CAPACITY.div_ceil(64), 1, 1);
+            pass.dispatch_workgroups(DERIVE_BATCH_CAPACITY.div_ceil(64), 1, 1);
         }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -598,14 +593,14 @@ impl WebGpuVanitySearch {
             });
             pass.set_pipeline(&self.normalize_pipeline);
             pass.set_bind_group(0, &self.normalize_group, &[]);
-            pass.dispatch_workgroups(BATCH_CAPACITY.div_ceil(64), 1, 1);
+            pass.dispatch_workgroups(DERIVE_BATCH_CAPACITY.div_ceil(64), 1, 1);
         }
         encoder.copy_buffer_to_buffer(
             &self.affine_output,
             0,
             &self.staging,
             0,
-            BATCH_CAPACITY as u64 * POINT_BYTES as u64,
+            DERIVE_BATCH_CAPACITY as u64 * POINT_BYTES as u64,
         );
         self.queue.submit(Some(encoder.finish()));
         readback(&self.device, &self.staging).await
