@@ -1,3 +1,5 @@
+override use_unrolled_field_arithmetic: bool = false;
+
 const N0: u32 = 0xfffcfffdu;
 
 const P_LIMBS: array<u32, 12> = array<u32, 12>(
@@ -169,7 +171,224 @@ fn mont_mul_arr(a: array<u32, 12>, b: array<u32, 12>) -> array<u32, 12> {
   return fp_reduce(t, tN);
 }
 
+struct WideFp {
+  l0: u32,
+  l1: u32,
+  l2: u32,
+  l3: u32,
+  l4: u32,
+  l5: u32,
+  l6: u32,
+  l7: u32,
+  l8: u32,
+  l9: u32,
+  l10: u32,
+  l11: u32,
+  extra: u32,
+}
+
+struct FpReduction {
+  value: Fp,
+  borrow: u32,
+}
+
+struct FpWithExtra {
+  value: Fp,
+  extra: u32,
+}
+
+fn wide_fp_zero() -> WideFp {
+  var value: WideFp;
+  value.l0 = 0u;
+  value.l1 = 0u;
+  value.l2 = 0u;
+  value.l3 = 0u;
+  value.l4 = 0u;
+  value.l5 = 0u;
+  value.l6 = 0u;
+  value.l7 = 0u;
+  value.l8 = 0u;
+  value.l9 = 0u;
+  value.l10 = 0u;
+  value.l11 = 0u;
+  value.extra = 0u;
+  return value;
+}
+
+fn wide_fp_value(value: WideFp) -> Fp {
+  return Fp(
+    vec4<u32>(value.l0, value.l1, value.l2, value.l3),
+    vec4<u32>(value.l4, value.l5, value.l6, value.l7),
+    vec4<u32>(value.l8, value.l9, value.l10, value.l11),
+  );
+}
+
+fn fp_ge_modulus_unrolled(value: Fp) -> bool {
+  if (value.c.w != P_LIMBS[11]) { return value.c.w > P_LIMBS[11]; }
+  if (value.c.z != P_LIMBS[10]) { return value.c.z > P_LIMBS[10]; }
+  if (value.c.y != P_LIMBS[9]) { return value.c.y > P_LIMBS[9]; }
+  if (value.c.x != P_LIMBS[8]) { return value.c.x > P_LIMBS[8]; }
+  if (value.b.w != P_LIMBS[7]) { return value.b.w > P_LIMBS[7]; }
+  if (value.b.z != P_LIMBS[6]) { return value.b.z > P_LIMBS[6]; }
+  if (value.b.y != P_LIMBS[5]) { return value.b.y > P_LIMBS[5]; }
+  if (value.b.x != P_LIMBS[4]) { return value.b.x > P_LIMBS[4]; }
+  if (value.a.w != P_LIMBS[3]) { return value.a.w > P_LIMBS[3]; }
+  if (value.a.z != P_LIMBS[2]) { return value.a.z > P_LIMBS[2]; }
+  if (value.a.y != P_LIMBS[1]) { return value.a.y > P_LIMBS[1]; }
+  return value.a.x >= P_LIMBS[0];
+}
+
+fn fp_sub_modulus_unrolled(value: Fp) -> FpReduction {
+  var result: FpReduction;
+  var borrow = 0u;
+  let r0 = sub_borrow(value.a.x, P_LIMBS[0], borrow);
+  result.value.a.x = r0.x; borrow = r0.y;
+  let r1 = sub_borrow(value.a.y, P_LIMBS[1], borrow);
+  result.value.a.y = r1.x; borrow = r1.y;
+  let r2 = sub_borrow(value.a.z, P_LIMBS[2], borrow);
+  result.value.a.z = r2.x; borrow = r2.y;
+  let r3 = sub_borrow(value.a.w, P_LIMBS[3], borrow);
+  result.value.a.w = r3.x; borrow = r3.y;
+  let r4 = sub_borrow(value.b.x, P_LIMBS[4], borrow);
+  result.value.b.x = r4.x; borrow = r4.y;
+  let r5 = sub_borrow(value.b.y, P_LIMBS[5], borrow);
+  result.value.b.y = r5.x; borrow = r5.y;
+  let r6 = sub_borrow(value.b.z, P_LIMBS[6], borrow);
+  result.value.b.z = r6.x; borrow = r6.y;
+  let r7 = sub_borrow(value.b.w, P_LIMBS[7], borrow);
+  result.value.b.w = r7.x; borrow = r7.y;
+  let r8 = sub_borrow(value.c.x, P_LIMBS[8], borrow);
+  result.value.c.x = r8.x; borrow = r8.y;
+  let r9 = sub_borrow(value.c.y, P_LIMBS[9], borrow);
+  result.value.c.y = r9.x; borrow = r9.y;
+  let r10 = sub_borrow(value.c.z, P_LIMBS[10], borrow);
+  result.value.c.z = r10.x; borrow = r10.y;
+  let r11 = sub_borrow(value.c.w, P_LIMBS[11], borrow);
+  result.value.c.w = r11.x;
+  result.borrow = r11.y;
+  return result;
+}
+
+fn fp_reduce_once_unrolled(state_in: FpWithExtra) -> FpWithExtra {
+  var state = state_in;
+  if (state.extra == 0u && !fp_ge_modulus_unrolled(state.value)) {
+    return state;
+  }
+  let reduced = fp_sub_modulus_unrolled(state.value);
+  state.value = reduced.value;
+  state.extra -= reduced.borrow;
+  return state;
+}
+
+fn fp_reduce_unrolled(value: Fp, extra: u32) -> Fp {
+  var state: FpWithExtra;
+  state.value = value;
+  state.extra = extra;
+  state = fp_reduce_once_unrolled(state);
+  state = fp_reduce_once_unrolled(state);
+  state = fp_reduce_once_unrolled(state);
+  state = fp_reduce_once_unrolled(state);
+  return state.value;
+}
+
+fn montgomery_round_unrolled(state_in: WideFp, a_limb: u32, b: Fp) -> WideFp {
+  var state = state_in;
+  var carry = 0u;
+  let a0 = mac(state.l0, a_limb, b.a.x, carry);
+  state.l0 = a0.x; carry = a0.y;
+  let a1 = mac(state.l1, a_limb, b.a.y, carry);
+  state.l1 = a1.x; carry = a1.y;
+  let a2 = mac(state.l2, a_limb, b.a.z, carry);
+  state.l2 = a2.x; carry = a2.y;
+  let a3 = mac(state.l3, a_limb, b.a.w, carry);
+  state.l3 = a3.x; carry = a3.y;
+  let a4 = mac(state.l4, a_limb, b.b.x, carry);
+  state.l4 = a4.x; carry = a4.y;
+  let a5 = mac(state.l5, a_limb, b.b.y, carry);
+  state.l5 = a5.x; carry = a5.y;
+  let a6 = mac(state.l6, a_limb, b.b.z, carry);
+  state.l6 = a6.x; carry = a6.y;
+  let a7 = mac(state.l7, a_limb, b.b.w, carry);
+  state.l7 = a7.x; carry = a7.y;
+  let a8 = mac(state.l8, a_limb, b.c.x, carry);
+  state.l8 = a8.x; carry = a8.y;
+  let a9 = mac(state.l9, a_limb, b.c.y, carry);
+  state.l9 = a9.x; carry = a9.y;
+  let a10 = mac(state.l10, a_limb, b.c.z, carry);
+  state.l10 = a10.x; carry = a10.y;
+  let a11 = mac(state.l11, a_limb, b.c.w, carry);
+  state.l11 = a11.x; carry = a11.y;
+
+  let upper_add = addc(state.extra, carry, 0u);
+  let upper = upper_add.x;
+  var next_extra = upper_add.y;
+  let multiplier = state.l0 * N0;
+  carry = 0u;
+  let p0 = mac(state.l0, multiplier, P_LIMBS[0], carry);
+  state.l0 = p0.x; carry = p0.y;
+  let p1 = mac(state.l1, multiplier, P_LIMBS[1], carry);
+  state.l1 = p1.x; carry = p1.y;
+  let p2 = mac(state.l2, multiplier, P_LIMBS[2], carry);
+  state.l2 = p2.x; carry = p2.y;
+  let p3 = mac(state.l3, multiplier, P_LIMBS[3], carry);
+  state.l3 = p3.x; carry = p3.y;
+  let p4 = mac(state.l4, multiplier, P_LIMBS[4], carry);
+  state.l4 = p4.x; carry = p4.y;
+  let p5 = mac(state.l5, multiplier, P_LIMBS[5], carry);
+  state.l5 = p5.x; carry = p5.y;
+  let p6 = mac(state.l6, multiplier, P_LIMBS[6], carry);
+  state.l6 = p6.x; carry = p6.y;
+  let p7 = mac(state.l7, multiplier, P_LIMBS[7], carry);
+  state.l7 = p7.x; carry = p7.y;
+  let p8 = mac(state.l8, multiplier, P_LIMBS[8], carry);
+  state.l8 = p8.x; carry = p8.y;
+  let p9 = mac(state.l9, multiplier, P_LIMBS[9], carry);
+  state.l9 = p9.x; carry = p9.y;
+  let p10 = mac(state.l10, multiplier, P_LIMBS[10], carry);
+  state.l10 = p10.x; carry = p10.y;
+  let p11 = mac(state.l11, multiplier, P_LIMBS[11], carry);
+  state.l11 = p11.x; carry = p11.y;
+
+  let reduced_upper = addc(upper, carry, 0u);
+  next_extra += reduced_upper.y;
+  var next: WideFp;
+  next.l0 = state.l1;
+  next.l1 = state.l2;
+  next.l2 = state.l3;
+  next.l3 = state.l4;
+  next.l4 = state.l5;
+  next.l5 = state.l6;
+  next.l6 = state.l7;
+  next.l7 = state.l8;
+  next.l8 = state.l9;
+  next.l9 = state.l10;
+  next.l10 = state.l11;
+  next.l11 = reduced_upper.x;
+  next.extra = next_extra;
+  return next;
+}
+
+fn mont_mul_unrolled(a: Fp, b: Fp) -> Fp {
+  var state = wide_fp_zero();
+  state = montgomery_round_unrolled(state, a.a.x, b);
+  state = montgomery_round_unrolled(state, a.a.y, b);
+  state = montgomery_round_unrolled(state, a.a.z, b);
+  state = montgomery_round_unrolled(state, a.a.w, b);
+  state = montgomery_round_unrolled(state, a.b.x, b);
+  state = montgomery_round_unrolled(state, a.b.y, b);
+  state = montgomery_round_unrolled(state, a.b.z, b);
+  state = montgomery_round_unrolled(state, a.b.w, b);
+  state = montgomery_round_unrolled(state, a.c.x, b);
+  state = montgomery_round_unrolled(state, a.c.y, b);
+  state = montgomery_round_unrolled(state, a.c.z, b);
+  state = montgomery_round_unrolled(state, a.c.w, b);
+  return fp_reduce_unrolled(wide_fp_value(state), state.extra);
+}
+
 fn fp_mul(a: Fp, b: Fp) -> Fp {
+  if (use_unrolled_field_arithmetic) {
+    return mont_mul_unrolled(a, b);
+  }
   return fp_from_arr(mont_mul_arr(fp_to_arr(a), fp_to_arr(b)));
 }
 

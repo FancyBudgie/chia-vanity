@@ -90,6 +90,14 @@ interface GpuSearcher {
         wantedPrefix: string,
         wantedSuffix: string,
     ): Promise<GpuBatchResult>;
+    enqueueBatch(
+        startIndex: number,
+        count: number,
+        step: number,
+        addressPrefix: string,
+        wantedPrefix: string,
+        wantedSuffix: string,
+    ): Promise<GpuBatchResult>;
     free(): void;
 }
 
@@ -98,33 +106,45 @@ interface GpuSearcher {
 // them into adaptive sizing: high fixed overhead could otherwise pin the
 // search at one candidate forever.
 const GPU_BOOTSTRAP_BATCH_SIZES = [1, 64, 256, 1_024] as const;
-const GPU_MIN_BATCH_SIZE = 1_024;
-const GPU_BATCH_ALIGNMENT = 256;
-const GPU_TARGET_BATCH_MS = 250;
+const GPU_MAX_BATCH_MS = 1_000;
+const GPU_MIN_THROUGHPUT_PROBE_BATCH = 8_192;
+const GPU_REGRESSION_RATIO = 0.9;
+const GPU_QUEUE_TEST_BATCHES = 2;
+const GPU_PIPELINE_MIN_GAIN_RATIO = 1.02;
 
-function nextGpuBatchSize(
+interface GpuBatchTuningState {
+    bestBatchSize: number;
+    bestThroughput: number;
+}
+
+function tuneGpuBatchSize(
     currentCount: number,
     elapsedMs: number,
     capacity: number,
-): number {
+    state: GpuBatchTuningState,
+): { batchSize: number; settled: boolean } {
     if (!Number.isFinite(elapsedMs) || elapsedMs <= 0) {
-        return currentCount;
+        return { batchSize: currentCount, settled: false };
     }
 
-    // Keep individual dispatches well below the Windows GPU watchdog while
-    // allowing fast devices to ramp to the full batch capacity.
-    const scale = Math.max(
-        0.5,
-        Math.min(2, GPU_TARGET_BATCH_MS / elapsedMs),
-    );
-    const desired = Math.round(
-        (currentCount * scale) / GPU_BATCH_ALIGNMENT,
-    ) * GPU_BATCH_ALIGNMENT;
+    const throughput = currentCount / elapsedMs;
+    if (throughput > state.bestThroughput) {
+        state.bestThroughput = throughput;
+        state.bestBatchSize = currentCount;
+    }
 
-    return Math.max(
-        Math.min(GPU_MIN_BATCH_SIZE, capacity),
-        Math.min(capacity, desired),
-    );
+    const regressed = currentCount >= GPU_MIN_THROUGHPUT_PROBE_BATCH &&
+        throughput < state.bestThroughput * GPU_REGRESSION_RATIO;
+    const reachedLimit = currentCount >= capacity || elapsedMs >= GPU_MAX_BATCH_MS;
+
+    if (regressed || reachedLimit) {
+        return { batchSize: state.bestBatchSize, settled: true };
+    }
+
+    return {
+        batchSize: Math.min(capacity, currentCount * 2),
+        settled: false,
+    };
 }
 
 const CHIA_PURPOSE = 12381;
@@ -593,12 +613,72 @@ async function runGpuSearch(
         GPU_BOOTSTRAP_BATCH_SIZES[bootstrapBatch],
         searcher.batchCapacity,
     );
+    let batchSizeSettled = false;
+    let tuningStatusReported = false;
+    const batchTuningState: GpuBatchTuningState = {
+        bestBatchSize: Math.min(
+            GPU_BOOTSTRAP_BATCH_SIZES[GPU_BOOTSTRAP_BATCH_SIZES.length - 1],
+            searcher.batchCapacity,
+        ),
+        bestThroughput: 0,
+    };
+
+    const isStopped = () => shouldStop ||
+        (cancelView !== null && Atomics.load(cancelView, 0) === 1);
+
+    const handleResult = (result: GpuBatchResult): boolean => {
+        if (typeof result.hitIndex !== 'number') {
+            postMessage({
+                type: 'progress',
+                payload: { checked: result.checked },
+            } satisfies WorkerResponse);
+            return false;
+        }
+
+        const verified = deriveCandidatesForIndex(
+            root,
+            result.hitIndex,
+            'unhardened',
+            prefix,
+        )[0];
+
+        if (
+            !verified ||
+            (typeof result.hitAddress === 'string' &&
+                verified.address.toLowerCase() !== result.hitAddress.toLowerCase()) ||
+            !matchesWantedAddress(
+                verified.address,
+                wantedPrefixLower,
+                wantedSuffixLower,
+            )
+        ) {
+            throw new Error(
+                `GPU candidate ${result.hitIndex} failed canonical CPU verification ` +
+                `(GPU ${result.hitAddress ?? 'missing'}, CPU ${verified?.address ?? 'missing'})`,
+            );
+        }
+
+        postMessage({
+            type: 'progress',
+            payload: { checked: result.checked },
+        } satisfies WorkerResponse);
+
+        if (payload.searchMode === 'fast') {
+            postMessage({ type: 'hit', payload: verified } satisfies WorkerResponse);
+        } else {
+            postMessage({
+                type: 'done',
+                payload: { hit: verified },
+            } satisfies WorkerResponse);
+        }
+        return true;
+    };
+
     try {
-        while (index <= endIndex) {
-            if (
-                shouldStop ||
-                (cancelView !== null && Atomics.load(cancelView, 0) === 1)
-            ) {
+        // Warm up with watchdog-safe batches, then grow until each submission
+        // does enough work to amortize slower browser/driver queue overhead.
+        while (index <= endIndex && !batchSizeSettled) {
+            if (isStopped()) {
                 postMessage({ type: 'stopped' } satisfies WorkerResponse);
                 return;
             }
@@ -620,64 +700,157 @@ async function runGpuSearch(
                     searcher.batchCapacity,
                 );
             } else {
-                batchSize = nextGpuBatchSize(
+                if (!tuningStatusReported) {
+                    reportStatus('Optimizing GPU batch size…');
+                    tuningStatusReported = true;
+                }
+                const tuned = tuneGpuBatchSize(
                     count,
                     result.elapsedMs,
                     searcher.batchCapacity,
+                    batchTuningState,
                 );
+                batchSize = tuned.batchSize;
+                batchSizeSettled = tuned.settled;
             }
 
-            if (
-                typeof result.hitIndex === 'number'
-            ) {
-                const verified = deriveCandidatesForIndex(
-                    root,
-                    result.hitIndex,
-                    'unhardened',
-                    prefix,
-                )[0];
-
-                if (
-                    !verified ||
-                    (typeof result.hitAddress === 'string' &&
-                        verified.address.toLowerCase() !== result.hitAddress.toLowerCase()) ||
-                    !matchesWantedAddress(
-                        verified.address,
-                        wantedPrefixLower,
-                        wantedSuffixLower,
-                    )
-                ) {
-                    throw new Error(
-                        `GPU candidate ${result.hitIndex} failed canonical CPU verification ` +
-                        `(GPU ${result.hitAddress ?? 'missing'}, CPU ${verified?.address ?? 'missing'})`,
-                    );
-                }
-
-                postMessage({
-                    type: 'progress',
-                    payload: { checked: result.checked },
-                } satisfies WorkerResponse);
-
-                if (payload.searchMode === 'fast') {
-                    postMessage({ type: 'hit', payload: verified } satisfies WorkerResponse);
-                } else {
-                    postMessage({
-                        type: 'done',
-                        payload: { hit: verified },
-                    } satisfies WorkerResponse);
-                }
+            if (handleResult(result)) {
                 return;
             }
 
-            postMessage({
-                type: 'progress',
-                payload: { checked: result.checked },
-            } satisfies WorkerResponse);
-
             if (count >= remaining) {
-                break;
+                postMessage({ type: 'done', payload: { hit: null } } satisfies WorkerResponse);
+                return;
             }
             index += count * payload.step;
+        }
+
+        reportStatus('Testing GPU queue performance…');
+
+        let sequentialChecked = 0;
+        const sequentialStarted = performance.now();
+        for (let sample = 0; sample < GPU_QUEUE_TEST_BATCHES; sample += 1) {
+            if (isStopped()) {
+                postMessage({ type: 'stopped' } satisfies WorkerResponse);
+                return;
+            }
+
+            const remaining = Math.floor((endIndex - index) / payload.step) + 1;
+            const count = Math.min(batchSize, remaining);
+            const result = await searcher.searchBatch(
+                index,
+                count,
+                payload.step,
+                prefix,
+                wantedPrefixLower,
+                wantedSuffixLower,
+            );
+            sequentialChecked += result.checked;
+            if (handleResult(result)) {
+                return;
+            }
+            index += count * payload.step;
+            if (count >= remaining) {
+                postMessage({ type: 'done', payload: { hit: null } } satisfies WorkerResponse);
+                return;
+            }
+        }
+        const sequentialThroughput = sequentialChecked /
+            Math.max(1, performance.now() - sequentialStarted);
+
+        // Try two queued submissions on the real browser before committing to
+        // pipelining. WebKit can serialize result mapping in a way that makes
+        // this slower, while Chromium commonly benefits from the overlap.
+        const pending: Array<Promise<GpuBatchResult>> = [];
+        const enqueueNext = () => {
+            const remaining = Math.floor((endIndex - index) / payload.step) + 1;
+            const count = Math.min(batchSize, remaining);
+            const promise = searcher.enqueueBatch(
+                index,
+                count,
+                payload.step,
+                prefix,
+                wantedPrefixLower,
+                wantedSuffixLower,
+            );
+            // A prior batch may find a hit and free the device before this
+            // promise is awaited. Mark rejection handled in that case.
+            void promise.catch(() => undefined);
+            pending.push(promise);
+            index += count * payload.step;
+        };
+
+        const pipelineStarted = performance.now();
+        while (pending.length < GPU_QUEUE_TEST_BATCHES && index <= endIndex) {
+            enqueueNext();
+        }
+        const pipelineSamples = pending.length;
+        let pipelineChecked = 0;
+        for (let sample = 0; sample < pipelineSamples; sample += 1) {
+            const result = await pending.shift()!;
+            if (isStopped()) {
+                postMessage({ type: 'stopped' } satisfies WorkerResponse);
+                return;
+            }
+            pipelineChecked += result.checked;
+            if (handleResult(result)) {
+                return;
+            }
+        }
+        const pipelineThroughput = pipelineChecked /
+            Math.max(1, performance.now() - pipelineStarted);
+        const usePipeline = pipelineSamples === GPU_QUEUE_TEST_BATCHES &&
+            pipelineThroughput >= sequentialThroughput * GPU_PIPELINE_MIN_GAIN_RATIO;
+
+        reportStatus('GPU optimized; searching…');
+
+        if (!usePipeline) {
+            while (index <= endIndex) {
+                if (isStopped()) {
+                    postMessage({ type: 'stopped' } satisfies WorkerResponse);
+                    return;
+                }
+
+                const remaining = Math.floor((endIndex - index) / payload.step) + 1;
+                const count = Math.min(batchSize, remaining);
+                const result = await searcher.searchBatch(
+                    index,
+                    count,
+                    payload.step,
+                    prefix,
+                    wantedPrefixLower,
+                    wantedSuffixLower,
+                );
+                if (handleResult(result)) {
+                    return;
+                }
+                index += count * payload.step;
+            }
+
+            postMessage({ type: 'done', payload: { hit: null } } satisfies WorkerResponse);
+            return;
+        }
+
+        // Keep two submissions queued when the browser proved that overlapping
+        // compute with the previous 16-byte readback improves throughput.
+        while (pending.length > 0 || index <= endIndex) {
+            if (isStopped()) {
+                postMessage({ type: 'stopped' } satisfies WorkerResponse);
+                return;
+            }
+
+            while (pending.length < 2 && index <= endIndex) {
+                enqueueNext();
+            }
+
+            const result = await pending.shift()!;
+            if (isStopped()) {
+                postMessage({ type: 'stopped' } satisfies WorkerResponse);
+                return;
+            }
+            if (handleResult(result)) {
+                return;
+            }
         }
 
         postMessage({ type: 'done', payload: { hit: null } } satisfies WorkerResponse);

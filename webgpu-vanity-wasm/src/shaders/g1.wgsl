@@ -126,6 +126,55 @@ fn projective_to_affine(p: Projective) -> Affine {
   return out;
 }
 
+struct FpPair {
+  first: Fp,
+  second: Fp,
+}
+
+fn projective_z_or_one(p: Projective, enabled: bool) -> Fp {
+  if (enabled && p.inf == 0u && !fp_is_zero(p.z)) {
+    return p.z;
+  }
+  return fp_one();
+}
+
+// Montgomery's trick for two independent points within one invocation. This
+// replaces two expensive Fermat inversions with one inversion and three field
+// multiplications, without workgroup memory or synchronization.
+fn projective_pair_inverses(
+  first: Projective,
+  second: Projective,
+  second_enabled: bool,
+) -> FpPair {
+  let first_z = projective_z_or_one(first, true);
+  let second_z = projective_z_or_one(second, second_enabled);
+  let product_inverse = fp_inverse(fp_mul(first_z, second_z));
+  var result: FpPair;
+  result.first = fp_mul(product_inverse, second_z);
+  result.second = fp_mul(product_inverse, first_z);
+  return result;
+}
+
+fn projective_to_affine_with_inverse(
+  p: Projective,
+  z_inverse: Fp,
+  enabled: bool,
+) -> Affine {
+  var out: Affine;
+  if (!enabled || p.inf != 0u || fp_is_zero(p.z)) {
+    out.x = fp_zero();
+    out.y = fp_zero();
+    out.inf = 1u;
+    return out;
+  }
+  let z2 = fp_sqr(z_inverse);
+  let z3 = fp_mul(z2, z_inverse);
+  out.x = fp_mul(p.x, z2);
+  out.y = fp_mul(p.y, z3);
+  out.inf = 0u;
+  return out;
+}
+
 fn scalar_bit_lsb(scalar: array<u32, 32>, bit: u32) -> u32 {
   let byte_idx = 31u - bit / 8u;
   let bit_idx = bit % 8u;

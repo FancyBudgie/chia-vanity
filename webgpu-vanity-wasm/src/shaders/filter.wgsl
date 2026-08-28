@@ -121,3 +121,110 @@ fn search_finish_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicMin(&lowest_hit_index, index);
   }
 }
+
+fn filter_combined_result(index: u32, puzzle_hash: array<u32, 32>) {
+  if (params.suffix_len == 0u) {
+    if (puzzle_hash_prefix_matches(puzzle_hash)) {
+      atomicMin(&lowest_hit_index, index);
+    }
+    return;
+  }
+
+  let address_values = bech32_data_values(params.hrp_kind, puzzle_hash);
+  if (bech32_values_match(address_values)) {
+    atomicMin(&lowest_hit_index, index);
+  }
+}
+
+// WebKit/Metal performs substantially better when the complete derivation
+// stays in one invocation instead of round-tripping projective points and
+// child keys through storage buffers between four separate compute passes.
+// Other backends keep using the split kernels above to avoid long-dispatch
+// watchdog and device-loss issues observed on Windows.
+@compute @workgroup_size(64)
+fn combined_search_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let first_offset = gid.x * 2u;
+  if (first_offset >= params.count) {
+    return;
+  }
+  let second_offset = first_offset + 1u;
+  let second_enabled = second_offset < params.count;
+
+  let first_index = params.start_index + first_offset * params.step;
+  let first_child_offset = derive_unhardened_offset(first_index);
+  var first_child = fixed_base_mul_generator(first_child_offset);
+  first_child = projective_add_affine(first_child, account_affine());
+
+  var second_index = 0u;
+  var second_child_offset: array<u32, 32>;
+  var second_child = projective_inf();
+  if (second_enabled) {
+    second_index = params.start_index + second_offset * params.step;
+    second_child_offset = derive_unhardened_offset(second_index);
+    second_child = fixed_base_mul_generator(second_child_offset);
+    second_child = projective_add_affine(second_child, account_affine());
+  }
+
+  let child_inverses = projective_pair_inverses(
+    first_child,
+    second_child,
+    second_enabled,
+  );
+  let first_child_affine = projective_to_affine_with_inverse(
+    first_child,
+    child_inverses.first,
+    true,
+  );
+  let first_child_pk = compress_g1(first_child_affine);
+  let first_synthetic_scalar = synthetic_scalar_from_child(
+    first_child_pk,
+    first_child_offset,
+  );
+  var first_synthetic = fixed_base_mul_generator(first_synthetic_scalar);
+  first_synthetic = projective_add_affine(first_synthetic, account_affine());
+
+  var second_synthetic = projective_inf();
+  if (second_enabled) {
+    let second_child_affine = projective_to_affine_with_inverse(
+      second_child,
+      child_inverses.second,
+      true,
+    );
+    let second_child_pk = compress_g1(second_child_affine);
+    let second_synthetic_scalar = synthetic_scalar_from_child(
+      second_child_pk,
+      second_child_offset,
+    );
+    second_synthetic = fixed_base_mul_generator(second_synthetic_scalar);
+    second_synthetic = projective_add_affine(second_synthetic, account_affine());
+  }
+
+  let synthetic_inverses = projective_pair_inverses(
+    first_synthetic,
+    second_synthetic,
+    second_enabled,
+  );
+  let first_synthetic_affine = projective_to_affine_with_inverse(
+    first_synthetic,
+    synthetic_inverses.first,
+    true,
+  );
+  let first_synthetic_pk = compress_g1(first_synthetic_affine);
+  filter_combined_result(
+    first_index,
+    standard_puzzle_hash_from_synthetic_pk(first_synthetic_pk),
+  );
+
+  if (second_enabled) {
+    let second_synthetic_affine = projective_to_affine_with_inverse(
+      second_synthetic,
+      synthetic_inverses.second,
+      true,
+    );
+    let second_synthetic_pk = compress_g1(second_synthetic_affine);
+    filter_combined_result(
+      second_index,
+      standard_puzzle_hash_from_synthetic_pk(second_synthetic_pk),
+    );
+  }
+}
