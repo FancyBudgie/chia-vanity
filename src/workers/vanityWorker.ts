@@ -93,10 +93,14 @@ interface GpuSearcher {
     free(): void;
 }
 
-const GPU_INITIAL_BATCH_SIZE = 1;
-const GPU_MIN_BATCH_SIZE = 1;
-const GPU_BATCH_ALIGNMENT = 1;
-const GPU_TARGET_BATCH_MS = 100;
+// The first tiny batches validate the device without risking a long watchdog
+// dispatch. Their timings include browser and driver warm-up, so never feed
+// them into adaptive sizing: high fixed overhead could otherwise pin the
+// search at one candidate forever.
+const GPU_BOOTSTRAP_BATCH_SIZES = [1, 64, 256, 1_024] as const;
+const GPU_MIN_BATCH_SIZE = 1_024;
+const GPU_BATCH_ALIGNMENT = 256;
+const GPU_TARGET_BATCH_MS = 250;
 
 function nextGpuBatchSize(
     currentCount: number,
@@ -584,7 +588,11 @@ async function runGpuSearch(
     const wantedPrefixLower = payload.wantedPrefix.toLowerCase();
     const wantedSuffixLower = payload.wantedSuffix.toLowerCase();
     let index = payload.startIndex;
-    let batchSize = Math.min(GPU_INITIAL_BATCH_SIZE, searcher.batchCapacity);
+    let bootstrapBatch = 0;
+    let batchSize = Math.min(
+        GPU_BOOTSTRAP_BATCH_SIZES[bootstrapBatch],
+        searcher.batchCapacity,
+    );
     try {
         while (index <= endIndex) {
             if (
@@ -605,11 +613,19 @@ async function runGpuSearch(
                 wantedPrefixLower,
                 wantedSuffixLower,
             );
-            batchSize = nextGpuBatchSize(
-                count,
-                result.elapsedMs,
-                searcher.batchCapacity,
-            );
+            if (bootstrapBatch < GPU_BOOTSTRAP_BATCH_SIZES.length - 1) {
+                bootstrapBatch += 1;
+                batchSize = Math.min(
+                    GPU_BOOTSTRAP_BATCH_SIZES[bootstrapBatch],
+                    searcher.batchCapacity,
+                );
+            } else {
+                batchSize = nextGpuBatchSize(
+                    count,
+                    result.elapsedMs,
+                    searcher.batchCapacity,
+                );
+            }
 
             if (
                 typeof result.hitIndex === 'number'
