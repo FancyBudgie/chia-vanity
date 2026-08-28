@@ -1,14 +1,15 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { runtime } from '../runtime';
 import type {
-    CpuTuningPayload,
     DeriveAddressPayload,
     Mode,
+    SearchEngine,
     SearchHitPayload,
     SearchMode,
     StartSearchRequest,
     UiState,
 } from '../runtime/types';
+import { RecentRate } from '../lib/recentRate';
 import {
     validateWantedPatterns,
     validateWantedPrefix,
@@ -56,8 +57,7 @@ export default function VanityApp() {
     const [mode, setMode] = useState<Mode>('unhardened');
     const [workerCount, setWorkerCount] = useState(0);
     const [searchMode, setSearchMode] = useState<SearchMode>('fast');
-    const [cpuSearchEnabled, setCpuSearchEnabled] = useState(false);
-    const [gpuSearchEnabled, setGpuSearchEnabled] = useState(true);
+    const [selectedSearchEngine, setSelectedSearchEngine] = useState<SearchEngine>('gpu');
     const [deriveIndex, setDeriveIndex] = useState(0);
     const [derivePrefix, setDerivePrefix] = useState<AddressPrefix>('xch');
     const [deriving, setDeriving] = useState(false);
@@ -67,7 +67,6 @@ export default function VanityApp() {
     const [ratePerSec, setRatePerSec] = useState(0);
     const [elapsedSecs, setElapsedSecs] = useState(0);
     const [activeCpuWorkers, setActiveCpuWorkers] = useState<number | null>(null);
-    const [cpuTuning, setCpuTuning] = useState<CpuTuningPayload | null>(null);
     const [results, setResults] = useState<Array<SearchHitPayload | DeriveAddressPayload>>([]);
     const [resultLabel, setResultLabel] = useState('No result yet');
     const [error, setError] = useState('');
@@ -202,10 +201,11 @@ export default function VanityApp() {
                 if (event.cpuWorkers !== undefined) {
                     setActiveCpuWorkers(event.cpuWorkers);
                 }
-                if (event.cpuTuning !== undefined) {
-                    setCpuTuning(event.cpuTuning);
+                if (event.status) {
+                    setStatus(event.status);
+                } else if (event.checked > 0) {
+                    setStatus('Searching');
                 }
-                setStatus('Searching');
                 setUiState((prev) => (prev === 'stopping' ? prev : 'running'));
             });
 
@@ -273,27 +273,20 @@ export default function VanityApp() {
     const isSagePublicSource =
         isSage && activeCredentialSource === 'sage' && credentialKind === 'public';
     const webGpuExposed = typeof navigator !== 'undefined' && 'gpu' in navigator;
+    const insecureWebGpuContext =
+        typeof window !== 'undefined' && !window.isSecureContext;
     const gpuUnavailableReason = mode !== 'unhardened'
         ? 'GPU unavailable: WebGPU search supports unhardened derivation only.'
         : isSagePublicSource
             ? 'GPU unavailable: Sage public-key search supplies derived keys and must use the CPU.'
+            : insecureWebGpuContext
+                ? 'GPU unavailable: WebGPU requires HTTPS or localhost; this LAN HTTP page is not a secure context.'
             : !webGpuExposed
                 ? 'GPU unavailable: this browser does not expose WebGPU.'
                 : null;
     const gpuSearchAvailable = gpuUnavailableReason === null;
-    useEffect(() => {
-        if (!gpuSearchAvailable) {
-            setGpuSearchEnabled(false);
-            setCpuSearchEnabled(true);
-        }
-    }, [gpuSearchAvailable]);
-    const effectiveGpuSearchEnabled = gpuSearchAvailable && gpuSearchEnabled;
-    const effectiveCpuSearchEnabled = cpuSearchEnabled || !effectiveGpuSearchEnabled;
-    const searchEngine = effectiveCpuSearchEnabled && effectiveGpuSearchEnabled
-        ? 'hybrid'
-        : effectiveGpuSearchEnabled
-            ? 'gpu'
-            : 'cpu';
+    const searchEngine: SearchEngine =
+        selectedSearchEngine === 'gpu' && gpuSearchAvailable ? 'gpu' : 'cpu';
     const canUsePublicCredential = mode === 'unhardened';
     const hasSageKeyPermission = sageCapabilities.includes(WALLET_PUBLIC_KEYS_CAPABILITY);
     const hasSageSecretPermission = sageCapabilities.includes(WALLET_SECRET_CAPABILITY);
@@ -367,14 +360,7 @@ export default function VanityApp() {
         setRatePerSec(0);
         setElapsedSecs(0);
         setActiveCpuWorkers(null);
-        setCpuTuning(null);
-        setStatus(
-            effectiveGpuSearchEnabled
-                ? effectiveCpuSearchEnabled
-                    ? 'Preparing WebGPU and CPU workers…'
-                    : 'Preparing WebGPU…'
-                : 'Starting CPU workers…',
-        );
+        setStatus(searchEngine === 'gpu' ? 'Preparing WebGPU…' : 'Starting CPU workers…');
         setUiState('running');
         sageSearchCancelRef.current = false;
         manualStopRequestedRef.current = false;
@@ -457,38 +443,6 @@ export default function VanityApp() {
 
             return previous === 'public' ? 'private' : previous;
         });
-    }
-
-    function handleComputeChange(kind: 'cpu' | 'gpu', enabled: boolean) {
-        if (kind === 'cpu') {
-            if (enabled) {
-                setCpuSearchEnabled(true);
-                return;
-            }
-
-            if (!gpuSearchEnabled) {
-                if (!gpuSearchAvailable) {
-                    return;
-                }
-                setGpuSearchEnabled(true);
-            }
-            setCpuSearchEnabled(false);
-            return;
-        }
-
-        if (!gpuSearchAvailable) {
-            return;
-        }
-
-        if (enabled) {
-            setGpuSearchEnabled(true);
-            return;
-        }
-
-        if (!cpuSearchEnabled) {
-            setCpuSearchEnabled(true);
-        }
-        setGpuSearchEnabled(false);
     }
 
     async function handleDerive() {
@@ -581,6 +535,8 @@ export default function VanityApp() {
         let nextIndex = clampU32(req.startIndex);
         let checkedCount = 0;
         const started = performance.now();
+        const recentRate = new RecentRate();
+        recentRate.reset(started);
         const wantedPrefixLower = req.wantedPrefix.toLowerCase();
         const wantedSuffixLower = req.wantedSuffix.toLowerCase();
         const addressPrefix = req.addressPrefix;
@@ -617,7 +573,7 @@ export default function VanityApp() {
 
                 const elapsed = (performance.now() - started) / 1000;
                 setChecked(checkedCount);
-                setRatePerSec(elapsed > 0 ? checkedCount / elapsed : 0);
+                setRatePerSec(recentRate.sample(checkedCount));
                 setElapsedSecs(elapsed);
                 setStatus('Searching');
 
@@ -820,10 +776,10 @@ export default function VanityApp() {
 
                             <div style={styles.field}>
                                 <span style={styles.labelText}>Derivation mode</span>
-                                <div style={styles.checkboxRow}>
-                                    <label style={styles.checkboxOption}>
+                                <div style={styles.selectionRow}>
+                                    <label style={styles.selectionOption}>
                                         <input
-                                            style={styles.checkboxInput}
+                                            style={styles.selectionInput}
                                             type="checkbox"
                                             checked={unhardenedSelected}
                                             onChange={(e) => handleKeyModeChange('unhardened', e.target.checked)}
@@ -831,9 +787,9 @@ export default function VanityApp() {
                                         />
                                         <span>Unhardened</span>
                                     </label>
-                                    <label style={styles.checkboxOption}>
+                                    <label style={styles.selectionOption}>
                                         <input
-                                            style={styles.checkboxInput}
+                                            style={styles.selectionInput}
                                             type="checkbox"
                                             checked={hardenedSelected}
                                             onChange={(e) => handleKeyModeChange('hardened', e.target.checked)}
@@ -1041,45 +997,38 @@ export default function VanityApp() {
 
                                 <div style={styles.computePicker}>
                                     <span style={styles.labelText}>Search with</span>
-                                    <div style={styles.checkboxRow}>
+                                    <div style={styles.selectionRow}>
                                         <label
                                             style={{
-                                                ...styles.checkboxOption,
+                                                ...styles.selectionOption,
                                                 ...(!gpuSearchAvailable
-                                                    ? styles.checkboxOptionDisabled
+                                                    ? styles.selectionOptionDisabled
                                                     : null),
                                             }}
                                             title={gpuUnavailableReason ?? 'Use WebGPU for the search'}
                                         >
                                             <input
-                                                style={styles.checkboxInput}
-                                                type="checkbox"
-                                                checked={effectiveGpuSearchEnabled}
-                                                onChange={(e) => handleComputeChange('gpu', e.target.checked)}
-                                                disabled={
-                                                    inputsDisabled ||
-                                                    !gpuSearchAvailable
-                                                }
+                                                style={styles.selectionInput}
+                                                type="radio"
+                                                name="search-engine"
+                                                checked={searchEngine === 'gpu'}
+                                                onChange={() => setSelectedSearchEngine('gpu')}
+                                                disabled={inputsDisabled || !gpuSearchAvailable}
                                             />
                                             <span>GPU (WebGPU)</span>
                                         </label>
                                         <label
                                             style={{
-                                                ...styles.checkboxOption,
-                                                ...(effectiveCpuSearchEnabled && !effectiveGpuSearchEnabled && !gpuSearchAvailable
-                                                    ? styles.checkboxOptionDisabled
-                                                    : null),
+                                                ...styles.selectionOption,
                                             }}
                                         >
                                             <input
-                                                style={styles.checkboxInput}
-                                                type="checkbox"
-                                                checked={effectiveCpuSearchEnabled}
-                                                onChange={(e) => handleComputeChange('cpu', e.target.checked)}
-                                                disabled={
-                                                    inputsDisabled ||
-                                                    (effectiveCpuSearchEnabled && !effectiveGpuSearchEnabled && !gpuSearchAvailable)
-                                                }
+                                                style={styles.selectionInput}
+                                                type="radio"
+                                                name="search-engine"
+                                                checked={searchEngine === 'cpu'}
+                                                onChange={() => setSelectedSearchEngine('cpu')}
+                                                disabled={inputsDisabled}
                                             />
                                             <span>CPU</span>
                                         </label>
@@ -1116,7 +1065,7 @@ export default function VanityApp() {
                                             label="CPU workers (0 = auto)"
                                             value={workerCount}
                                             onChange={setWorkerCount}
-                                            disabled={inputsDisabled || !effectiveCpuSearchEnabled}
+                                            disabled={inputsDisabled || searchEngine !== 'cpu'}
                                         />
 
                                         <NumberField
@@ -1219,20 +1168,6 @@ export default function VanityApp() {
                                     <Metric label="CPU workers" value={activeCpuWorkers.toLocaleString()} />
                                 ) : null}
                             </div>
-                            {cpuTuning ? (
-                                <div style={styles.tuningStatus}>
-                                    <span
-                                        style={{
-                                            ...styles.tuningDot,
-                                            ...(cpuTuning.phase === 'optimized'
-                                                ? styles.tuningDotOptimized
-                                                : null),
-                                        }}
-                                        aria-hidden="true"
-                                    />
-                                    <span>{formatCpuTuning(cpuTuning)}</span>
-                                </div>
-                            ) : null}
                         </section>
                     ) : null}
 
@@ -1578,33 +1513,6 @@ function formatNumber(value: number): string {
     return value.toFixed(0);
 }
 
-function formatCpuTuning(tuning: CpuTuningPayload): string {
-    const sampleProgress = tuning.sample > 0
-        ? ` · sample ${Math.min(tuning.sample, tuning.maxSamples)} of up to ${tuning.maxSamples}`
-        : '';
-
-    if (tuning.phase === 'stabilizing') {
-        return `Auto-tuning: stabilizing ${tuning.workers} CPU workers${sampleProgress}`;
-    }
-
-    if (tuning.phase === 'testing-more') {
-        return `Auto-tuning: testing ${tuning.workers} CPU workers${sampleProgress}`;
-    }
-
-    if (tuning.phase === 'testing-fewer') {
-        return `Auto-tuning: testing ${tuning.workers} CPU workers${sampleProgress}`;
-    }
-
-    if (tuning.phase === 'gpu-fallback') {
-        return `GPU became unavailable; continuing with ${tuning.workers} CPU workers.`;
-    }
-
-    const measuredRate = tuning.bestRatePerSec !== undefined
-        ? ` · best measured ${formatNumber(tuning.bestRatePerSec)}/s`
-        : '';
-    return `Auto-tuning complete: optimized at ${tuning.workers} CPU workers${measuredRate}`;
-}
-
 const monoStack =
     'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace';
 
@@ -1810,31 +1718,6 @@ const styles: Record<string, React.CSSProperties> = {
         overflowWrap: 'anywhere',
         textTransform: 'none',
     },
-    tuningStatus: {
-        display: 'flex',
-        alignItems: 'center',
-        gap: 9,
-        marginTop: 12,
-        padding: '10px 12px',
-        borderRadius: 8,
-        border: '1px solid var(--divider)',
-        background: 'var(--control-bg-muted)',
-        color: 'var(--text-muted)',
-        fontSize: 12,
-        lineHeight: 1.45,
-    },
-    tuningDot: {
-        width: 8,
-        height: 8,
-        flex: '0 0 auto',
-        borderRadius: '50%',
-        background: 'var(--warning-text)',
-        boxShadow: '0 0 0 3px var(--warning-bg)',
-    },
-    tuningDotOptimized: {
-        background: 'var(--accent-text)',
-        boxShadow: '0 0 0 3px var(--accent-soft)',
-    },
     panel: {
         padding: 18,
         borderRadius: 8,
@@ -1940,14 +1823,14 @@ const styles: Record<string, React.CSSProperties> = {
         fontSize: 12,
         lineHeight: 1.35,
     },
-    checkboxRow: {
+    selectionRow: {
         display: 'flex',
         alignItems: 'center',
         gap: 8,
         flexWrap: 'wrap',
         minHeight: 40,
     },
-    checkboxOption: {
+    selectionOption: {
         display: 'inline-flex',
         alignItems: 'center',
         gap: 8,
@@ -1962,11 +1845,11 @@ const styles: Record<string, React.CSSProperties> = {
         cursor: 'pointer',
         userSelect: 'none',
     },
-    checkboxOptionDisabled: {
+    selectionOptionDisabled: {
         opacity: 0.5,
         cursor: 'not-allowed',
     },
-    checkboxInput: {
+    selectionInput: {
         width: 14,
         height: 14,
         margin: 0,

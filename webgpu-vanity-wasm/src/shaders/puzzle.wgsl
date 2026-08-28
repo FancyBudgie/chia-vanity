@@ -71,7 +71,7 @@ fn standard_puzzle_hash_from_synthetic_pk(synthetic_pk: array<u32, 48>) -> array
   return shatree_pair(A_KW_TREEHASH, mod_and_args);
 }
 
-fn synthetic_pk_from_child(child_pk: array<u32, 48>, child_affine: Affine) -> array<u32, 48> {
+fn synthetic_scalar_from_child(child_pk: array<u32, 48>, child_offset: array<u32, 32>) -> array<u32, 32> {
   var offset_input: array<u32, 80>;
   for (var i = 0u; i < 48u; i++) {
     offset_input[i] = child_pk[i];
@@ -81,8 +81,5 @@ fn synthetic_pk_from_child(child_pk: array<u32, 48>, child_affine: Affine) -> ar
   }
   var offset = sha256_bytes(&offset_input, 80u);
   offset = reduce_signed_scalar_mod_order(offset);
-  var projective = fixed_base_mul_generator(offset);
-  projective = projective_add_affine(projective, child_affine);
-  let affine = projective_to_affine(projective);
-  return compress_g1(affine);
+  return add_scalars_mod_order(child_offset, offset);
 }

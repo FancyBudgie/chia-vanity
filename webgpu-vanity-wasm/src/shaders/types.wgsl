@@ -35,3 +35,5 @@ struct Params {
 @group(0) @binding(1) var<storage, read> account_key: array<u32>;
 @group(0) @binding(2) var<storage, read> g1_table: array<u32>;
 @group(0) @binding(3) var<storage, read_write> lowest_hit_index: atomic<u32>;
+@group(0) @binding(4) var<storage, read_write> child_keys: array<u32>;
+@group(0) @binding(5) var<storage, read_write> projective_keys: array<Projective>;

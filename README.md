@@ -92,14 +92,11 @@ Inside Sage, use **Load Sage key** for public-key-only unhardened searches throu
 
 ### Browser CPU and GPU search
 
-The browser app exposes separate CPU and GPU checkboxes next to the search target. Both are selected by default so compatible unhardened searches use their combined throughput:
+The browser app exposes mutually exclusive GPU and CPU options next to the search target. GPU is selected by default when it is available:
 
-- CPU and GPU workers receive disjoint index ranges, so they never duplicate successful work.
-- Fast hybrid auto mode starts at about 47% of the browser-reported logical threads, then tunes the live CPU worker count up or down from stabilized aggregate-rate samples. Workers draw bounded ranges from a shared coordinator, so adjustment does not skip or duplicate indexes. An explicit CPU worker count still disables tuning and overrides the automatic value.
-- The progress panel shows the current tuning phase and sample count, then keeps the optimized worker count and best measured rate visible once tuning settles.
-- Unchecking the only selected engine switches to the other engine when it is available. Unavailable engines are disabled with an explanation in the UI.
-- If WebGPU is unavailable or fails while both engines are selected, CPU workers take over its unfinished range without leaving a gap.
-- GPU-only search keeps one bounded 4,096-address batch in flight and supports unhardened derivation.
+- GPU search keeps one fixed-capacity batch in flight and supports unhardened derivation.
+- Startup messages show adapter selection, shader compilation, memory allocation, and each warm-up pass before the first checked address appears.
+- The displayed rate uses a rolling recent window, so it reflects current warmed-up throughput instead of averaging startup into the whole run.
 - Every GPU match is re-derived and checked with the canonical CPU Chia wallet SDK before it is shown.
 - Hardened searches use the CPU. Sage's public-key bridge also uses the CPU because it supplies already-derived public keys rather than an account public key; importing a private key or entering key material manually supports the normal GPU path.
 
@@ -233,7 +230,7 @@ The CPU path is an embarrassingly parallel workload:
 - Apple M2:
   - ~100 seconds for 4 characters after `xch1`
 
-The WebGPU result depends heavily on the browser, GPU, and driver. On the development Mac, the warmed end-to-end GPU path sustained about 66,900 verified address candidates per second versus 29,700/second for the previous CPU-bridged GPU implementation. GPU batches start small and adapt toward roughly 250 ms per dispatch, providing responsive progress updates and avoiding long Windows dispatches that can trigger the GPU watchdog. Use the in-app rate for the device you are actually searching on.
+The WebGPU result depends heavily on the browser, GPU, and driver. On the development Mac, the warmed end-to-end GPU path sustained about 66,900 verified address candidates per second versus 29,700/second for the previous CPU-bridged GPU implementation. GPU batches start with a single partial workgroup and adapt toward roughly 100 ms per dispatch, providing responsive progress updates and avoiding long Windows dispatches that can trigger the GPU watchdog. Use the in-app rate for the device you are actually searching on.
 
 ---
 

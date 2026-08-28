@@ -1,23 +1,14 @@
 export type Mode = 'hardened' | 'unhardened' | 'both';
 export type SearchMode = 'fast' | 'lowest';
-export type SearchEngine = 'auto' | 'cpu' | 'gpu' | 'hybrid';
+export type SearchEngine = 'cpu' | 'gpu';
 export type UiState = 'idle' | 'running' | 'stopping';
-
-export interface CpuTuningPayload {
-    phase: 'stabilizing' | 'testing-more' | 'testing-fewer' | 'optimized' | 'gpu-fallback';
-    workers: number;
-    sample: number;
-    maxSamples: number;
-    bestWorkers?: number;
-    bestRatePerSec?: number;
-}
 
 export interface SearchProgressPayload {
     checked: number;
     ratePerSec: number;
     elapsedSecs: number;
     cpuWorkers?: number;
-    cpuTuning?: CpuTuningPayload;
+    status?: string;
 }
 
 export interface SearchHitPayload {
