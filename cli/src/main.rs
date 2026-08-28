@@ -1,5 +1,7 @@
 use std::{
     cmp::Ordering,
+    env,
+    io::{self, IsTerminal, Read},
     str::FromStr,
     sync::{
         atomic::{AtomicBool, Ordering as AtomicOrdering},
@@ -15,9 +17,11 @@ use chia_puzzle_types::{standard::StandardArgs, DeriveSynthetic};
 use chia_sdk_types::Mod;
 use chia_sdk_utils::Address;
 use clap::{Parser, ValueEnum};
+use zeroize::Zeroizing;
 
 const BECH32_DATA_CHARS: &str = "023456789acdefghjklmnpqrstuvwxyz";
 const CHIA_ADDRESS_PREFIXES: [&str; 2] = ["xch1", "txch1"];
+const MNEMONIC_ENV_VAR: &str = "CHIA_VANITY_MNEMONIC";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -26,7 +30,12 @@ const CHIA_ADDRESS_PREFIXES: [&str; 2] = ["xch1", "txch1"];
     about = "Find Chia receive addresses matching a prefix and/or suffix."
 )]
 struct Cli {
-    /// The wallet mnemonic phrase. Required for hardened mode; optional for unhardened when --public-key is used.
+    /// The wallet mnemonic phrase passed directly on the command line.
+    ///
+    /// This is insecure because it can be saved in shell history and exposed to
+    /// process inspection. Omit it to use a hidden prompt, stdin, or
+    /// CHIA_VANITY_MNEMONIC instead.
+    #[arg(value_name = "MNEMONIC")]
     mnemonic: Option<String>,
 
     /// Master public key hex for unhardened derivation without private key material.
@@ -114,16 +123,17 @@ enum WalletRoot {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
-    let wallet_root = Arc::new(wallet_root_from_cli(&cli)?);
+    let mut cli = Cli::parse();
 
     if let Some(index) = cli.derive_index {
         let address_prefix = infer_address_prefix("", &cli.address_prefix)?;
+        let wallet_root = wallet_root_from_cli(&mut cli)?;
         print_derived_addresses(&wallet_root, index, cli.mode, &address_prefix);
         return Ok(());
     }
 
     let config = SearchConfig::from_cli(&cli)?;
+    let wallet_root = Arc::new(wallet_root_from_cli(&mut cli)?);
 
     eprintln!(
         "Searching {} addresses from index {} with {} thread(s)...",
@@ -218,12 +228,16 @@ impl SearchConfig {
 
 fn master_sk_from_mnemonic(mnemonic_phrase: &str) -> Result<SecretKey> {
     let mnemonic = Mnemonic::from_str(mnemonic_phrase).context("invalid mnemonic")?;
-    let seed = mnemonic.to_seed("");
-    Ok(SecretKey::from_seed(&seed))
+    let seed = Zeroizing::new(mnemonic.to_seed(""));
+    Ok(SecretKey::from_seed(seed.as_slice()))
 }
 
-fn wallet_root_from_cli(cli: &Cli) -> Result<WalletRoot> {
+fn wallet_root_from_cli(cli: &mut Cli) -> Result<WalletRoot> {
     if let Some(public_key) = cli.public_key.as_deref() {
+        if cli.mnemonic.is_some() {
+            bail!("mnemonic and --public-key cannot be used together");
+        }
+
         if cli.mode != Mode::Unhardened {
             bail!("--public-key can only be used with --mode unhardened");
         }
@@ -231,15 +245,94 @@ fn wallet_root_from_cli(cli: &Cli) -> Result<WalletRoot> {
         return Ok(WalletRoot::Public(master_public_key_from_hex(public_key)?));
     }
 
-    let Some(mnemonic) = cli.mnemonic.as_deref() else {
-        if cli.mode == Mode::Unhardened {
-            bail!("mnemonic or --public-key is required for unhardened mode");
+    let mnemonic = resolve_mnemonic(cli)?;
+
+    Ok(WalletRoot::Secret(master_sk_from_mnemonic(&mnemonic)?))
+}
+
+fn resolve_mnemonic(cli: &mut Cli) -> Result<Zeroizing<String>> {
+    if let Some(mnemonic) = cli.mnemonic.take() {
+        eprintln!(
+            "warning: passing the mnemonic on the command line is insecure; \
+             omit it to use the hidden prompt or stdin"
+        );
+        return normalize_mnemonic(&Zeroizing::new(mnemonic));
+    }
+
+    let env_mnemonic = env_mnemonic()?;
+
+    if io::stdin().is_terminal() {
+        return match env_mnemonic {
+            Some(mnemonic) => Ok(mnemonic),
+            None => prompt_mnemonic(),
+        };
+    }
+
+    let stdin_mnemonic =
+        read_mnemonic(&mut io::stdin().lock()).context("could not read a mnemonic from stdin")?;
+    select_noninteractive_mnemonic(stdin_mnemonic, env_mnemonic)
+}
+
+fn env_mnemonic() -> Result<Option<Zeroizing<String>>> {
+    match env::var(MNEMONIC_ENV_VAR) {
+        Ok(value) => {
+            // Read this before worker threads start, then stop inheriting the
+            // secret into child processes for the rest of a long search.
+            env::remove_var(MNEMONIC_ENV_VAR);
+            normalize_optional_mnemonic(&Zeroizing::new(value))
         }
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => bail!("{MNEMONIC_ENV_VAR} contains invalid UTF-8"),
+    }
+}
 
-        bail!("mnemonic is required for hardened mode");
-    };
+fn prompt_mnemonic() -> Result<Zeroizing<String>> {
+    let phrase = Zeroizing::new(
+        rpassword::prompt_password("Enter mnemonic (input hidden): ")
+            .context("failed to read mnemonic from terminal")?,
+    );
+    normalize_mnemonic(&phrase)
+}
 
-    Ok(WalletRoot::Secret(master_sk_from_mnemonic(mnemonic)?))
+fn read_mnemonic(reader: &mut impl Read) -> Result<Option<Zeroizing<String>>> {
+    let mut buffer = Zeroizing::new(String::new());
+    reader
+        .read_to_string(&mut buffer)
+        .context("failed to read mnemonic")?;
+    normalize_optional_mnemonic(&buffer)
+}
+
+fn select_noninteractive_mnemonic(
+    stdin_mnemonic: Option<Zeroizing<String>>,
+    env_mnemonic: Option<Zeroizing<String>>,
+) -> Result<Zeroizing<String>> {
+    match (stdin_mnemonic, env_mnemonic) {
+        (Some(_), Some(_)) => bail!(
+            "mnemonic was provided through both stdin and {MNEMONIC_ENV_VAR}; use only one source"
+        ),
+        (Some(mnemonic), None) | (None, Some(mnemonic)) => Ok(mnemonic),
+        (None, None) => bail!(
+            "mnemonic or --public-key is required; pipe a mnemonic into stdin, set \
+             {MNEMONIC_ENV_VAR}, or run from a terminal for a hidden prompt"
+        ),
+    }
+}
+
+fn normalize_optional_mnemonic(raw: &str) -> Result<Option<Zeroizing<String>>> {
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+
+    normalize_mnemonic(raw).map(Some)
+}
+
+fn normalize_mnemonic(raw: &str) -> Result<Zeroizing<String>> {
+    let normalized = Zeroizing::new(raw.split_whitespace().collect::<Vec<_>>().join(" "));
+    if normalized.is_empty() {
+        bail!("mnemonic is empty");
+    }
+
+    Ok(normalized)
 }
 
 fn master_public_key_from_hex(public_key: &str) -> Result<PublicKey> {
@@ -575,6 +668,56 @@ mod tests {
 
         assert!(is_better_hit(&unhardened, Some(&hardened)));
         assert!(!is_better_hit(&hardened, Some(&unhardened)));
+    }
+
+    #[test]
+    fn normalizes_mnemonic_whitespace() {
+        let mnemonic = normalize_mnemonic("  abandon   abandon\nabout \t").unwrap();
+        assert_eq!(mnemonic.as_str(), "abandon abandon about");
+    }
+
+    #[test]
+    fn reads_and_normalizes_mnemonic_from_reader() {
+        let mut reader = "abandon abandon about\n".as_bytes();
+        let mnemonic = read_mnemonic(&mut reader).unwrap().unwrap();
+        assert_eq!(mnemonic.as_str(), "abandon abandon about");
+    }
+
+    #[test]
+    fn treats_blank_noninteractive_input_as_absent() {
+        let mut reader = "  \n\t".as_bytes();
+        assert!(read_mnemonic(&mut reader).unwrap().is_none());
+    }
+
+    #[test]
+    fn rejects_ambiguous_noninteractive_mnemonic_sources() {
+        let stdin_mnemonic = normalize_optional_mnemonic("abandon about").unwrap();
+        let env_mnemonic = normalize_optional_mnemonic("legal winner").unwrap();
+
+        assert!(select_noninteractive_mnemonic(stdin_mnemonic, env_mnemonic).is_err());
+    }
+
+    #[test]
+    fn accepts_environment_mnemonic_when_stdin_is_empty() {
+        let env_mnemonic = normalize_optional_mnemonic("abandon about").unwrap();
+        let mnemonic = select_noninteractive_mnemonic(None, env_mnemonic).unwrap();
+
+        assert_eq!(mnemonic.as_str(), "abandon about");
+    }
+
+    #[test]
+    fn rejects_positional_mnemonic_with_public_key() {
+        let mut cli = Cli::try_parse_from([
+            "chia-vanity-cli",
+            "abandon abandon about",
+            "--public-key",
+            "00",
+            "--prefix",
+            "ace",
+        ])
+        .unwrap();
+
+        assert!(wallet_root_from_cli(&mut cli).is_err());
     }
 
     #[test]
