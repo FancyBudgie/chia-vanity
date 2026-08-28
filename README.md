@@ -16,6 +16,7 @@ xch1name...
 - Hardened derivation requires your **mnemonic (private key material)**.
 - Unhardened derivation can use a master public key instead.
 - **Never use a mnemonic you don’t trust this machine with.**
+- For the native CLI, use its hidden prompt or pipe from a password manager. Avoid putting a mnemonic in shell history or a plaintext file.
 - Build from source and review the code before running.
 
 ---
@@ -58,6 +59,7 @@ Valid characters (alphabetically sorted):
 ## 📦 Build
 
 ```bash
+git submodule update --init
 cargo build --release
 ```
 
@@ -102,13 +104,28 @@ The browser app exposes mutually exclusive GPU and CPU options next to the searc
 
 ---
 
+## 🔑 Providing a mnemonic to the native CLI
+
+When private key material is required, omit the mnemonic argument and the CLI will ask for it with a hidden, no-echo prompt. This is the recommended interactive method.
+
+For automation, pipe the mnemonic directly from a password manager:
+
+```bash
+pass show chia/mnemonic | cargo run --release -- --prefix xch1name
+```
+
+`CHIA_VANITY_MNEMONIC` is also supported for non-interactive environments, but processes running as the same user may be able to inspect environment variables. The CLI removes it from its own environment after reading it. If both stdin and the environment variable contain a mnemonic, the CLI stops instead of guessing which wallet to use.
+
+Passing a mnemonic as the legacy positional argument still works, but prints a warning because command-line arguments can appear in process inspection and shell history. Temporary mnemonic and seed buffers are cleared after the master key is derived.
+
+---
+
 ## ▶️ Usage
 
-The root workspace defaults to the native Rust CLI, so this does not start Tauri or use WASM:
+The root workspace defaults to the native Rust CLI, so this does not start Tauri or use WASM. With no mnemonic argument, it prompts privately:
 
 ```bash
 cargo run --release -- \
-  "<your mnemonic>" \
   --prefix xch1name \
   --suffix ace
 ```
@@ -119,7 +136,6 @@ At least one of `--prefix` or `--suffix` is required. When both are supplied, th
 
 ```bash
 cargo run --release -- \
-  "word1 word2 ... word24" \
   --prefix xch1name
 ```
 
@@ -127,7 +143,6 @@ cargo run --release -- \
 
 ```bash
 cargo run --release -- \
-  "word1 word2 ... word24" \
   --suffix ace
 ```
 
@@ -137,7 +152,6 @@ Suffix-only searches encode `xch` addresses by default. Use `--address-prefix tx
 
 ```bash
 cargo run --release -- \
-  "word1 word2 ... word24" \
   --prefix xch1name \
   --suffix ace
 ```
@@ -148,7 +162,6 @@ Use `--derive-index` to print the address at a known derivation index instead of
 
 ```bash
 cargo run --release -- \
-  "word1 word2 ... word24" \
   --derive-index 123456
 ```
 
